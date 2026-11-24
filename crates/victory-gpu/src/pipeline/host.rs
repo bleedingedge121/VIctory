@@ -917,6 +917,7 @@ fn shared_root_view(
 /// sets one address for the slot, so one view serves every stage); a
 /// table costs one root signature dword where a descriptor costs two.
 /// `ranges` keeps the range alive until the root signature is made.
+#[allow(clippy::vec_box)] // pointer stability for pDescriptorRanges across Vec reallocations
 fn push_root_uav_table(
     params: &mut Vec<D3D12_ROOT_PARAMETER1>,
     ranges: &mut Vec<Box<D3D12_DESCRIPTOR_RANGE1>>,
