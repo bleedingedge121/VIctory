@@ -225,27 +225,65 @@ struct Candidate {
     resource: usize,
     format: i32,
     draws: u32,
+    /// Written through an unordered-access view (by a compute pass).
+    uav: bool,
     copy: std::sync::Arc<crate::resource::HostTexture>,
 }
 
 /// This frame's candidates, in the order they were first noted.
 static CANDIDATES: std::sync::Mutex<Vec<Candidate>> = std::sync::Mutex::new(Vec::new());
 
-/// `VICTORY_PRESENT_PICK=draws`: present the candidate the frame drew the
-/// most into, instead of the last one written. A frame writes several
+/// Which candidate `VICTORY_PRESENT_PICK` presents. A frame writes several
 /// `2560x1440` targets and only one holds the scene, so taking the last one
-/// alternates between the scene and empty targets (#841).
-fn pick_by_draws() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        present_1440p_on()
-            && std::env::var("VICTORY_PRESENT_PICK").is_ok_and(|v| v.trim() == "draws")
+/// written alternates between the scene and empty targets (#841).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pick {
+    /// The last one written (the default).
+    Last,
+    /// `draws`: the one drawn into most.
+    Draws,
+    /// `uav`: the last one written by a compute pass.
+    Uav,
+    /// `f<n>`: the last one of DXGI format `n`.
+    Format(i32),
+}
+
+fn pick() -> Pick {
+    static PICK: std::sync::OnceLock<Pick> = std::sync::OnceLock::new();
+    *PICK.get_or_init(|| {
+        if !present_1440p_on() {
+            return Pick::Last;
+        }
+        let value = std::env::var("VICTORY_PRESENT_PICK").unwrap_or_default();
+        match value.trim() {
+            "draws" => Pick::Draws,
+            "uav" => Pick::Uav,
+            v => v
+                .strip_prefix('f')
+                .and_then(|n| n.parse().ok())
+                .map_or(Pick::Last, Pick::Format),
+        }
     })
+}
+
+fn pick_by_draws() -> bool {
+    pick() != Pick::Last
+}
+
+/// Notes a title texture a compute pass writes (see [`note_target`]).
+pub(crate) fn note_uav_target(resource: crate::object::This) {
+    note_target(resource);
+    if pick() != Pick::Last {
+        let mut candidates = CANDIDATES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = candidates.iter_mut().find(|c| c.resource == resource as usize) {
+            c.uav = true;
+        }
+    }
 }
 
 /// Credits a draw to the bound render targets that are candidates.
 pub(crate) fn note_draw(targets: &[usize]) {
-    if !pick_by_draws() || targets.is_empty() {
+    if pick() != Pick::Draws || targets.is_empty() {
         return;
     }
     let mut candidates = CANDIDATES.lock().unwrap_or_else(|e| e.into_inner());
@@ -266,25 +304,37 @@ pub(crate) fn take_1440p_target() -> Option<std::sync::Arc<crate::resource::Host
     if !pick_by_draws() {
         return last;
     }
-    let best = candidates.iter().enumerate().max_by_key(|(_, c)| c.draws);
+    let best = match pick() {
+        Pick::Draws => candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.draws > 0)
+            .max_by_key(|(_, c)| c.draws),
+        Pick::Uav => candidates.iter().enumerate().rev().find(|(_, c)| c.uav),
+        Pick::Format(f) => candidates.iter().enumerate().rev().find(|(_, c)| c.format == f),
+        Pick::Last => None,
+    };
     {
         use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
         static LOGGED: AtomicU32 = AtomicU32::new(0);
         if !candidates.is_empty() && LOGGED.fetch_add(1, Relaxed) < 30 {
             let list: Vec<String> = candidates
                 .iter()
-                .map(|c| format!("{:#x} f{} draws {}", c.resource, c.format, c.draws))
+                .map(|c| {
+                    let uav = if c.uav { " uav" } else { "" };
+                    format!("{:#x} f{} draws {}{uav}", c.resource, c.format, c.draws)
+                })
                 .collect();
             tracing::info!(
                 candidates = ?list,
                 picked = ?best.map(|(i, _)| i),
-                "VICTORY_PRESENT_PICK=draws"
+                "VICTORY_PRESENT_PICK"
             );
         }
     }
     match best {
-        Some((_, c)) if c.draws > 0 => Some(c.copy.clone()),
-        _ => last,
+        Some((_, c)) => Some(c.copy.clone()),
+        None => last,
     }
 }
 
@@ -316,6 +366,7 @@ pub(crate) fn note_target(resource: crate::object::This) {
                         resource: resource as usize,
                         format: d.Format.0,
                         draws: 0,
+                        uav: false,
                         copy: copy.clone(),
                     });
                 }

@@ -1727,7 +1727,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
         }
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(*resource as This);
+            crate::capture::note_uav_target(*resource as This);
             crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
         }
         _ => {}
