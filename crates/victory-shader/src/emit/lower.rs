@@ -2780,6 +2780,23 @@ impl<'a> Lower<'a> {
 
     fn lane_index(&mut self) -> V {
         if self.s.mesh.is_some() {
+            // On a host without 64-lane waves (NVIDIA's 32..32), wave64 mesh
+            // code runs as 32-lane waves: lane masks come from ballots over
+            // the host wave and hold no bits for console lanes 32-63. Count
+            // and pick lanes the host's way, so masks and lanes agree; mesh
+            // code reads no other lanes, so each host wave then acts as a
+            // narrower console wave (#940).
+            if self.x.native.wave64 && !self.x.target.runs(64) && self.x.target.runs(32) {
+                self.s.flags |= flags::WAVE_OPS;
+                return self.s.op(
+                    self.cur,
+                    "waveGetLaneIndex",
+                    Attr::ReadOnly,
+                    self.s.t.i32,
+                    111,
+                    &[],
+                );
+            }
             // The console's lane: mesh code reads no other lanes, so host
             // waves need not match the console's.
             let f = self.mesh_thread();
