@@ -1,0 +1,28 @@
+name: NVIDIA build artifact
+
+# Build-only workflow (no test/clippy gate) for iterating on a branch that is
+# being run against game data: produces the diagnostics executable the
+# README's debugging aids need.
+on:
+  push:
+    branches: [nvidia-test]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --profile diag -p victory --features diagnostics --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: victory-nvidia-diag-build
+          path: target/diag/victory.exe
+          if-no-files-found: error
+          retention-days: 7
