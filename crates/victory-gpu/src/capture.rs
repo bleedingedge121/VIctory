@@ -219,13 +219,73 @@ fn present_1440p_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PRESENT_1440P").is_some())
 }
 
-/// Takes the latest `2560x1440` color render target noted this frame, if
-/// `VICTORY_PRESENT_1440P` is enabled.
+/// A `2560x1440` color target noted this frame, with the draws made while it
+/// was bound (for `VICTORY_PRESENT_PICK=draws`).
+struct Candidate {
+    resource: usize,
+    format: i32,
+    draws: u32,
+    copy: std::sync::Arc<crate::resource::HostTexture>,
+}
+
+/// This frame's candidates, in the order they were first noted.
+static CANDIDATES: std::sync::Mutex<Vec<Candidate>> = std::sync::Mutex::new(Vec::new());
+
+/// `VICTORY_PRESENT_PICK=draws`: present the candidate the frame drew the
+/// most into, instead of the last one written. A frame writes several
+/// `2560x1440` targets and only one holds the scene, so taking the last one
+/// alternates between the scene and empty targets (#841).
+fn pick_by_draws() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        present_1440p_on()
+            && std::env::var("VICTORY_PRESENT_PICK").is_ok_and(|v| v.trim() == "draws")
+    })
+}
+
+/// Credits a draw to the bound render targets that are candidates.
+pub(crate) fn note_draw(targets: &[usize]) {
+    if !pick_by_draws() || targets.is_empty() {
+        return;
+    }
+    let mut candidates = CANDIDATES.lock().unwrap_or_else(|e| e.into_inner());
+    for c in candidates.iter_mut().filter(|c| targets.contains(&c.resource)) {
+        c.draws += 1;
+    }
+}
+
+/// Takes the `2560x1440` color render target to present this frame, if
+/// `VICTORY_PRESENT_1440P` is enabled: the latest one noted, or with
+/// `VICTORY_PRESENT_PICK=draws` the one drawn into most.
 pub(crate) fn take_1440p_target() -> Option<std::sync::Arc<crate::resource::HostTexture>> {
     if !present_1440p_on() {
         return None;
     }
-    LAST_1440P.lock().unwrap_or_else(|e| e.into_inner()).take()
+    let last = LAST_1440P.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let candidates = std::mem::take(&mut *CANDIDATES.lock().unwrap_or_else(|e| e.into_inner()));
+    if !pick_by_draws() {
+        return last;
+    }
+    let best = candidates.iter().enumerate().max_by_key(|(_, c)| c.draws);
+    {
+        use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+        static LOGGED: AtomicU32 = AtomicU32::new(0);
+        if !candidates.is_empty() && LOGGED.fetch_add(1, Relaxed) < 30 {
+            let list: Vec<String> = candidates
+                .iter()
+                .map(|c| format!("{:#x} f{} draws {}", c.resource, c.format, c.draws))
+                .collect();
+            tracing::info!(
+                candidates = ?list,
+                picked = ?best.map(|(i, _)| i),
+                "VICTORY_PRESENT_PICK=draws"
+            );
+        }
+    }
+    match best {
+        Some((_, c)) if c.draws > 0 => Some(c.copy.clone()),
+        _ => last,
+    }
 }
 
 fn dump_on() -> bool {
@@ -249,6 +309,17 @@ pub(crate) fn note_target(resource: crate::object::This) {
             && d.Height == 1440
             && matches!(d.Format.0, 28 | 29 | 87 | 91)
         {
+            if pick_by_draws() {
+                let mut candidates = CANDIDATES.lock().unwrap_or_else(|e| e.into_inner());
+                if !candidates.iter().any(|c| c.resource == resource as usize) {
+                    candidates.push(Candidate {
+                        resource: resource as usize,
+                        format: d.Format.0,
+                        draws: 0,
+                        copy: copy.clone(),
+                    });
+                }
+            }
             *LAST_1440P.lock().unwrap_or_else(|e| e.into_inner()) = Some(copy);
         }
     }

@@ -1090,6 +1090,8 @@ impl State {
                         emit_uav_barrier(list);
                     }
                     DRAWN.fetch_add(1, Ordering::Relaxed);
+                    #[cfg(feature = "diagnostics")]
+                    crate::capture::note_draw(&self.targets);
                     true
                 }
                 Err(_) => false,
@@ -1358,6 +1360,8 @@ impl State {
                 emit_uav_barrier(list);
             }
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::capture::note_draw(&self.targets);
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1450,6 +1454,8 @@ impl State {
                 emit_uav_barrier(list);
             }
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::capture::note_draw(&self.targets);
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1632,6 +1638,8 @@ impl State {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::capture::note_draw(&self.targets);
         }
         true
     }
