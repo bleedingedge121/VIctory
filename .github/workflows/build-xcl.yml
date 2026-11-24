@@ -1,0 +1,24 @@
+name: Build XCL
+on:
+  push:
+    branches: [cloud-build-exe]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ivall/xcl
+          ref: 47efa2e
+      - run: rustup default stable
+      - run: cargo build --release -p xcl --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xcl-windows-release
+          path: target/release/xcl.exe
+          if-no-files-found: error
+          retention-days: 7
