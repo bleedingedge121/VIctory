@@ -313,6 +313,11 @@ impl Shadow {
                 if a > at {
                     bytes += self.update_free(at, a);
                 }
+                // What the title wrote under the range goes in too: constants
+                // the title puts in the world's 174 MB heap are read under
+                // views of all of it, and skipped, a depth downsample read
+                // zero sizes and ran until the device was removed as hung.
+                bytes += self.update_busy(a.max(at), e.min(to));
                 at = at.max(e);
             }
             if at < to {
@@ -323,13 +328,55 @@ impl Shadow {
         self.update_free(from, to)
     }
 
+    /// [`Shadow::update`] of `[from, to)` (title addresses inside the
+    /// buffer) that ranges declared earlier in this submission cover. Their
+    /// shaders have not run yet (a submission waits for the one before it),
+    /// so what the title wrote is copied as anywhere else, and into the
+    /// snapshot [`Shadow::writing`] took as well, so that
+    /// [`Shadow::copy_back`] does not take it for a shader's write. Returns
+    /// the bytes copied.
+    fn update_busy(&self, from: usize, to: usize) -> usize {
+        if from >= to {
+            return 0;
+        }
+        let mut runs = Vec::new();
+        let bytes = self.update_free_runs(from, to, Some(&mut runs));
+        let start = self.start as usize;
+        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((taken, snap)) = &mut *before {
+            for (a, b) in runs {
+                // As offsets in the copy, cut to the snapshot.
+                let (a, b) = (
+                    (a - start).max(*taken),
+                    (b - start).min(*taken + snap.len()),
+                );
+                if a < b {
+                    // SAFETY: inside the mapping (`a..b` is in the buffer).
+                    let host = unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
+                    snap[a - *taken..b - *taken].copy_from_slice(host);
+                }
+            }
+        }
+        bytes
+    }
+
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
+        self.update_free_runs(from, to, None)
+    }
+
+    /// [`Shadow::update_free`], also listing the ranges copied in `runs`.
+    fn update_free_runs(
+        &self,
+        from: usize,
+        to: usize,
+        mut runs: Option<&mut Vec<(usize, usize)>>,
+    ) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
+                let copied = self.copy_stale(from, to, now, &written, runs.as_deref_mut());
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
@@ -340,6 +387,9 @@ impl Shadow {
             }
             self.watched.store(NOT_WATCHED, Ordering::Relaxed);
         }
+        if let Some(runs) = runs {
+            runs.push((from, to));
+        }
         self.copy(from, to);
         to - from
     }
@@ -347,7 +397,14 @@ impl Shadow {
     /// Copies the pages of `[from, to)` written after their last copy
     /// (`written`: last writes by page, in page order; `now`: this
     /// asking), whole pages within the buffer.
-    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+    fn copy_stale(
+        &self,
+        from: usize,
+        to: usize,
+        now: u64,
+        written: &[(usize, u64)],
+        mut runs: Option<&mut Vec<(usize, usize)>>,
+    ) -> usize {
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
@@ -371,12 +428,20 @@ impl Shadow {
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
-                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                let (a, b) = ((first * PAGE).max(from), (page * PAGE).min(to));
+                if let Some(runs) = runs.as_deref_mut() {
+                    runs.push((a, b));
+                }
+                bytes += self.copy(a, b);
             }
         }
         // Cut to the range: next to it shaders may be writing the copy.
         if let Some(first) = run {
-            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+            let (a, b) = ((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+            if let Some(runs) = runs {
+                runs.push((a, b));
+            }
+            bytes += self.copy(a, b);
         }
         bytes
     }
@@ -636,5 +701,73 @@ mod tests {
         s.copy_back(base, 2 * PAGE);
         assert_eq!(peek(base + 8), 2, "the title's newer byte");
         assert_eq!(peek(base + 3), 9, "the shader's byte");
+    }
+
+    /// A copy of title memory `[at, at + len)` holding the same bytes, if
+    /// there is a host device.
+    fn shadow_of(at: usize, len: usize) -> Option<Shadow> {
+        let (buffer, data) = host()?.shared_buffer((len as u64).next_multiple_of(PAGE as u64))?;
+        // SAFETY: the mapping holds `len` bytes; the title memory is ours.
+        unsafe { std::ptr::copy_nonoverlapping(at as *const u8, data, len) };
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        Some(Shadow::new(buffer, data, gpu, at as u64, len as u64))
+    }
+
+    /// What the title writes inside a range this submission's shaders write
+    /// reaches the copy before they run, and copy-back neither takes it for
+    /// a shader's write nor undoes the title's later writes with it.
+    #[test]
+    fn title_writes_under_a_busy_range_are_copied() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        // SAFETY: a fresh write-watched range, never freed (`watch` keeps
+        // its pages by address).
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                2 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(base, 0);
+        let Some(shadow) = shadow_of(base, 2 * PAGE) else {
+            return;
+        };
+        // SAFETY: offsets inside the title range and the copy.
+        let title = |at: usize| unsafe { (base as *mut u8).add(at) };
+        // SAFETY: as above.
+        let host = |at: usize| unsafe { shadow.data.add(at) };
+        shadow.update(base, 2 * PAGE);
+        // An earlier list declares all of it as written by shaders.
+        shadow.writing(base, 2 * PAGE);
+        // SAFETY: (all writes below) bytes of the title range and the copy,
+        // which nothing else uses.
+        unsafe { title(PAGE + 20).write(0x55) };
+        assert!(shadow.update(base + PAGE + 16, 16) > 0);
+        // SAFETY: as above.
+        unsafe {
+            assert_eq!(
+                host(PAGE + 20).read(),
+                0x55,
+                "the title's constant reaches the copy"
+            );
+            // The shaders run: one byte written. The title writes meanwhile.
+            host(10).write(0xaa);
+            title(PAGE + 20).write(0x66);
+        }
+        shadow.copy_back(base, 2 * PAGE);
+        // SAFETY: as above.
+        unsafe {
+            assert_eq!(title(10).read(), 0xaa, "the shader's write goes back");
+            assert_eq!(
+                title(PAGE + 20).read(),
+                0x66,
+                "the title's later write stays"
+            );
+        }
     }
 }
