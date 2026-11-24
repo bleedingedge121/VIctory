@@ -216,7 +216,11 @@ static LAST_1440P: std::sync::Mutex<Option<std::sync::Arc<crate::resource::HostT
 
 fn present_1440p_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PRESENT_1440P").is_some())
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_PRESENT_1440P")
+            .ok()
+            .is_none_or(|v| v.trim() != "0")
+    })
 }
 
 /// A `2560x1440` color target noted this frame, with the draws made while it
@@ -238,9 +242,9 @@ static CANDIDATES: std::sync::Mutex<Vec<Candidate>> = std::sync::Mutex::new(Vec:
 /// written alternates between the scene and empty targets (#841).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pick {
-    /// The last one written (the default).
+    /// The last one written.
     Last,
-    /// `draws`: the one drawn into most.
+    /// `draws`: the one drawn into most (the default).
     Draws,
     /// `uav`: the last one written by a compute pass.
     Uav,
@@ -256,12 +260,13 @@ fn pick() -> Pick {
         }
         let value = std::env::var("VICTORY_PRESENT_PICK").unwrap_or_default();
         match value.trim() {
-            "draws" => Pick::Draws,
+            "" | "draws" => Pick::Draws,
+            "last" => Pick::Last,
             "uav" => Pick::Uav,
             v => v
                 .strip_prefix('f')
                 .and_then(|n| n.parse().ok())
-                .map_or(Pick::Last, Pick::Format),
+                .map_or(Pick::Draws, Pick::Format),
         }
     })
 }
@@ -299,6 +304,8 @@ pub(crate) fn take_1440p_target() -> Option<std::sync::Arc<crate::resource::Host
     if !present_1440p_on() {
         return None;
     }
+    let explicit = std::env::var_os("VICTORY_PRESENT_1440P").is_some();
+    let min_draws = if explicit { 1 } else { 32 };
     let last = LAST_1440P.lock().unwrap_or_else(|e| e.into_inner()).take();
     let candidates = std::mem::take(&mut *CANDIDATES.lock().unwrap_or_else(|e| e.into_inner()));
     if !pick_by_draws() {
@@ -308,7 +315,7 @@ pub(crate) fn take_1440p_target() -> Option<std::sync::Arc<crate::resource::Host
         Pick::Draws => candidates
             .iter()
             .enumerate()
-            .filter(|(_, c)| c.draws > 0)
+            .filter(|(_, c)| c.draws >= min_draws)
             .max_by_key(|(_, c)| c.draws),
         Pick::Uav => candidates.iter().enumerate().rev().find(|(_, c)| c.uav),
         Pick::Format(f) => candidates.iter().enumerate().rev().find(|(_, c)| c.format == f),
@@ -334,7 +341,8 @@ pub(crate) fn take_1440p_target() -> Option<std::sync::Arc<crate::resource::Host
     }
     match best {
         Some((_, c)) => Some(c.copy.clone()),
-        None => last,
+        None if explicit => last,
+        None => None,
     }
 }
 

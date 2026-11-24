@@ -184,6 +184,9 @@ fn create() -> windows::core::Result<Host> {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
+        } else if let Some((adapter, name)) = high_performance_adapter() {
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            tracing::info!(adapter = %name, "host device");
         } else {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
@@ -237,6 +240,36 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
         })
+    }
+}
+
+/// The first hardware adapter, in high-performance order, that makes a D3D12
+/// device, with its name. A laptop's default adapter (the one a null adapter
+/// means) is its integrated GPU unless the user set a per-app preference in
+/// Windows; this picks the discrete one. None when DXGI cannot order them.
+fn high_performance_adapter() -> Option<(IDXGIAdapter1, String)> {
+    // SAFETY: plain DXGI adapter queries; the probe device is dropped.
+    unsafe {
+        let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        (0..)
+            .map_while(|i| {
+                factory
+                    .EnumAdapterByGpuPreference::<IDXGIAdapter1>(
+                        i,
+                        DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                    )
+                    .ok()
+            })
+            .find_map(|adapter| {
+                let desc = adapter.GetDesc1().ok()?;
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                    return None;
+                }
+                let mut probe: Option<ID3D12Device> = None;
+                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut probe).ok()?;
+                let name = String::from_utf16_lossy(&desc.Description);
+                Some((adapter, name.trim_end_matches('\0').to_owned()))
+            })
     }
 }
 
@@ -1009,20 +1042,17 @@ impl Host {
         }
         batch.flush();
         let prepared = std::time::Instant::now();
-        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
-        #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
-            firsts
-                .iter()
-                .zip(firsts.iter().skip(1).chain([&lists.len()]))
-                .map(|(&a, &b)| &lists[a..b])
-                .collect()
-        } else {
-            vec![&lists[..]]
-        };
-        #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
+        // Submit each title command list (with its prelude) individually so a
+        // multi-list world submission does not exceed Windows' TDR timeout.
+        let groups: Vec<&[Option<ID3D12CommandList>]> = firsts
+            .iter()
+            .zip(firsts.iter().skip(1).chain([&lists.len()]))
+            .map(|(&a, &b)| &lists[a..b])
+            .collect();
         for (i, group) in groups.iter().enumerate() {
+            if group.is_empty() {
+                continue;
+            }
             *submitted += 1;
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
@@ -1040,7 +1070,10 @@ impl Host {
                 }
             }
             #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
+            if timing()
+                && groups.len() > 1
+                && started.elapsed() > std::time::Duration::from_millis(50)
+            {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
@@ -1050,6 +1083,10 @@ impl Host {
                 }
             }
             let _ = (i, started);
+            // SAFETY: a plain query; stop submitting once the device is removed.
+            if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                break;
+            }
         }
         let _ = &firsts;
         let gpu = prepared.elapsed();
