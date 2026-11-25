@@ -70,6 +70,12 @@ cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths
 ```
 
+To build a downloadable Windows release, push a tag whose name starts with
+`v` (for example, `v0.1.0`). The Windows release workflow builds the
+executable and attaches `victory-windows-x64.zip` to the GitHub Release.
+The archive includes `victory.exe`, this README, the license, and an example
+configuration file.
+
 Run the title:
 
 ```powershell
